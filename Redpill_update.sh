@@ -290,6 +290,168 @@ read_includes(){
   esac
 }
 
+# ── Interactive "choose what to back up" checklist ──
+# Scans your real $HOME for every top-level file and folder (dotfiles
+# included), merges in any deeper paths already active in includes.conf
+# (e.g. ~/.local/share/fonts), and shows one checklist. Ticked entries are
+# written back to includes.conf; everything else in the file is dropped.
+#
+# The file keeps its two-section shape so read_includes / the configs|data|all
+# modes and the incremental --link-dest logic are all unchanged: well-known
+# user-data dirs go under "# User data", everything else under "# All configs".
+
+# Directories treated as "user data" (rest of the tree is "configs")
+_USERDATA_DIRS=(Documents Pictures Music Videos Desktop Downloads Templates Public)
+
+_is_userdata_path(){
+  # $1 = a path like ~/Pictures or /home/x/Pictures. Returns 0 if user-data.
+  local base="${1##*/}" d
+  for d in "${_USERDATA_DIRS[@]}"; do
+    [[ "$base" == "$d" ]] && return 0
+  done
+  return 1
+}
+
+# Normalise a path for comparison: expand leading ~ , strip trailing slash.
+_norm_path(){
+  local p="$1"
+  p="${p/#\~/$HOME}"
+  p="${p%/}"
+  printf '%s' "$p"
+}
+
+# Pretty form for display/storage: collapse $HOME back to ~
+_tilde_path(){
+  local p="$1"
+  [[ "$p" == "$HOME"/* ]] && p="~${p#"$HOME"}"
+  [[ "$p" == "$HOME" ]] && p="~"
+  printf '%s' "$p"
+}
+
+# Currently-active (uncommented) path lines from includes.conf, ~-collapsed.
+_active_includes(){
+  [[ -f "$INCLUDES_FILE" ]] || return 0
+  grep -vE '^\s*#' "$INCLUDES_FILE" | sed '/^\s*$/d;s/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+choose_includes(){
+  mkdir -p "$CONF_DIR"
+
+  # 1) Candidate set: everything directly in $HOME ...
+  local -A seen=()          # normalised path -> 1  (dedupe)
+  local -a cand=()          # ~-form paths, display order
+  local entry np
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    np="$(_norm_path "$entry")"
+    [[ -n "${seen[$np]:-}" ]] && continue
+    seen[$np]=1
+    cand+=("$(_tilde_path "$np")")
+  done < <(find "$HOME" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort -f | sed "s#^#$HOME/#")
+
+  # ... plus any deeper path already active in includes.conf (kept, ticked).
+  local -A active=()
+  local a
+  while IFS= read -r a; do
+    [[ -n "$a" ]] || continue
+    np="$(_norm_path "$a")"
+    active[$np]=1
+    if [[ -z "${seen[$np]:-}" ]]; then
+      seen[$np]=1
+      cand+=("$(_tilde_path "$np")")
+    fi
+  done < <(_active_includes)
+
+  if (( ${#cand[@]} == 0 )); then
+    _err "Nothing found in $HOME to choose from."
+    return 1
+  fi
+
+  # 2) Build checklist rows. Tag=index, item=path, state=ON if active now.
+  local -a cl_args=()
+  local i tag desc state
+  for i in "${!cand[@]}"; do
+    np="$(_norm_path "${cand[$i]}")"
+    state="OFF"; [[ -n "${active[$np]:-}" ]] && state="ON"
+    desc="${cand[$i]}"
+    if [[ -d "$np" ]]; then desc="$desc/"; fi
+    _is_userdata_path "$np" && desc="$desc   (user data)"
+    cl_args+=("$i" "$desc" "$state")
+  done
+
+  # 3) Present it
+  local result
+  if command -v whiptail >/dev/null; then
+    result=$(whiptail --title "$APP_TITLE" --checklist \
+      "Everything in your home directory. Space toggles, Enter saves.\nTicked entries are what gets backed up." \
+      26 82 17 "${cl_args[@]}" 3>&1 1>&2 2>&3) || return 1
+  else
+    _header "CHOOSE WHAT TO BACK UP"
+    for i in "${!cand[@]}"; do
+      np="$(_norm_path "${cand[$i]}")"
+      local mark=" "; [[ -n "${active[$np]:-}" ]] && mark="x"
+      local suffix=""; [[ -d "$np" ]] && suffix="/"
+      printf '  %s%3d.%s [%s] %s%s\n' "$_c_dim" "$i" "$_c_reset" "$mark" "${cand[$i]}" "$suffix"
+    done
+    _hr
+    printf '  Enter numbers to TOGGLE (space-separated), q to cancel: '
+    local input; read -r input
+    [[ "$input" == "q" ]] && return 1
+    # start from current state, flip toggled indices
+    local -A on=()
+    for i in "${!cand[@]}"; do
+      np="$(_norm_path "${cand[$i]}")"
+      [[ -n "${active[$np]:-}" ]] && on[$i]=1
+    done
+    local tok
+    for tok in $input; do
+      [[ "$tok" =~ ^[0-9]+$ ]] || continue
+      (( tok >= 0 && tok < ${#cand[@]} )) || continue
+      if [[ -n "${on[$tok]:-}" ]]; then unset 'on[$tok]'; else on[$tok]=1; fi
+    done
+    result=""
+    for i in "${!on[@]}"; do result+="\"$i\" "; done
+  fi
+
+  # 4) Resolve selected indices -> chosen paths, split into two sections
+  local -a pick_cfg=() pick_data=()
+  local idx
+  for idx in $(echo "$result" | tr -d '"'); do
+    [[ "$idx" =~ ^[0-9]+$ ]] || continue
+    (( idx >= 0 && idx < ${#cand[@]} )) || continue
+    local ppath="${cand[$idx]}"
+    if _is_userdata_path "$(_norm_path "$ppath")"; then
+      pick_data+=("$ppath")
+    else
+      pick_cfg+=("$ppath")
+    fi
+  done
+
+  if (( ${#pick_cfg[@]} + ${#pick_data[@]} == 0 )); then
+    _warn "Nothing selected — includes.conf left unchanged."
+    return 0
+  fi
+
+  # 5) Rewrite includes.conf (backup the old one once)
+  [[ -f "$INCLUDES_FILE" && ! -f "${INCLUDES_FILE}.bak" ]] && cp "$INCLUDES_FILE" "${INCLUDES_FILE}.bak"
+  local tmp="${INCLUDES_FILE}.tmp.$$"
+  {
+    echo "# Selected via 'redpill choose-includes' on $(date +%Y-%m-%d)"
+    echo "# Re-run that (or edit this file) to change what gets backed up."
+    echo
+    echo "# All configs"
+    local p
+    for p in "${pick_cfg[@]}"; do printf '%s\n' "$p"; done
+    echo
+    echo "# User data"
+    for p in "${pick_data[@]}"; do printf '%s\n' "$p"; done
+  } > "$tmp"
+  mv -f "$tmp" "$INCLUDES_FILE"
+
+  _ok "Saved ${#pick_cfg[@]} config + ${#pick_data[@]} data path(s) to includes.conf"
+  printf '  %sPrevious list kept at %s.bak%s\n' "$_c_dim" "$INCLUDES_FILE" "$_c_reset"
+}
+
 pre_backup_note(){
   echo
   printf '  %s%s%s\n' "$_c_dim" "You take the red pill, you stay in hyprland and" "$_c_reset"
@@ -298,6 +460,56 @@ pre_backup_note(){
 }
 
 # ── Destination management ──
+# Given a base directory (usually a drive mountpoint), optionally append a
+# subfolder so backups land in <base>/<subfolder> instead of the drive root.
+# Echoes the final path on stdout. Returns 1 if the user cancels.
+prompt_subfolder(){
+  local base="$1"
+  base="${base%/}"
+  local sub=""
+
+  if command -v whiptail >/dev/null; then
+    if ! whiptail --title "$APP_TITLE" --yesno \
+      "Back up to a folder on this destination instead of its root?\n\nBase: $base" 12 68; then
+      echo "$base"; return 0
+    fi
+    sub=$(whiptail --title "$APP_TITLE" --inputbox \
+      "Folder name (relative to base). Nested paths like 'backups/laptop' are fine:" \
+      10 68 "redpill-backups" 3>&1 1>&2 2>&3) || return 1
+  else
+    local yn
+    read -r -p "  Back up to a subfolder of $base instead of its root? [y/N] " yn
+    if [[ "${yn,,}" != "y" ]]; then
+      echo "$base"; return 0
+    fi
+    read -r -p "  Folder name (relative to base) [redpill-backups]: " sub
+    sub="${sub:-redpill-backups}"
+  fi
+
+  # Strip leading/trailing slashes and whitespace; reject absolute or ../ paths
+  sub="$(printf '%s' "$sub" | sed 's#^[[:space:]/]*##;s#[[:space:]/]*$##')"
+  if [[ -z "$sub" ]]; then
+    echo "$base"; return 0
+  fi
+  if [[ "$sub" == /* || "$sub" == *".."* ]]; then
+    _err "Invalid folder name: $sub"
+    return 1
+  fi
+
+  local full="$base/$sub"
+  if [[ ! -d "$full" ]]; then
+    if ! mkdir -p "$full" 2>/dev/null; then
+      if ! sudo mkdir -p "$full" 2>/dev/null; then
+        _err "Could not create folder: $full"
+        return 1
+      fi
+      # Created via sudo — hand ownership back so rsync can write without root
+      sudo chown "$(id -u):$(id -g)" "$full" 2>/dev/null || true
+    fi
+  fi
+  echo "$full"
+}
+
 read_destination(){
   if [[ -f "$DEST_FILE" ]]; then
     local d
@@ -311,7 +523,15 @@ check_destination(){
   local dest
   dest="$(read_destination)" || { _err "No backup destination configured. Use 'Set backup destination' first."; return 1; }
   if [[ ! -d "$dest" ]]; then
-    _err "Destination not mounted: $dest"
+    # The configured path may be a subfolder on a drive that is mounted but
+    # where the folder itself was removed. Recreate it if the parent exists.
+    local parent
+    parent="$(dirname "$dest")"
+    if [[ -d "$parent" ]] && mkdir -p "$dest" 2>/dev/null; then
+      echo "$dest"
+      return 0
+    fi
+    _err "Destination not available: $dest"
     printf '  %s\n' "Plug in the drive or run 'Set backup destination' to pick a new one."
     return 1
   fi
@@ -366,6 +586,7 @@ set_destination(){
       local manual
       manual=$(whiptail --title "$APP_TITLE" --inputbox "Enter backup destination path:" 10 60 "" 3>&1 1>&2 2>&3) || return 1
       [[ -n "$manual" ]] || return 1
+      manual="$(prompt_subfolder "$manual")" || return 1
       echo "$manual" > "$DEST_FILE"
       _ok "Destination set to: $manual"
     else
@@ -373,6 +594,7 @@ set_destination(){
       local manual
       read -r -p "  Enter backup destination path: " manual
       [[ -n "$manual" ]] || return 1
+      manual="$(prompt_subfolder "$manual")" || return 1
       echo "$manual" > "$DEST_FILE"
       _ok "Destination set to: $manual"
     fi
@@ -407,6 +629,7 @@ set_destination(){
       read -r -p "Enter backup destination path: " manual
     fi
     [[ -n "$manual" ]] || return 1
+    manual="$(prompt_subfolder "$manual")" || return 1
     echo "$manual" > "$DEST_FILE"
     echo "Destination set to: $manual"
     return 0
@@ -445,8 +668,10 @@ set_destination(){
     fi
   fi
 
-  echo "$chosen_mount" > "$DEST_FILE"
-  _ok "Destination set to: $chosen_mount"
+  local final_dest
+  final_dest="$(prompt_subfolder "$chosen_mount")" || return 1
+  echo "$final_dest" > "$DEST_FILE"
+  _ok "Destination set to: $final_dest"
 }
 
 # ── Expand include paths ──
@@ -1420,8 +1645,17 @@ auto_detect_destination(){
   for i in "${!_scan_dev[@]}"; do
     local mnt="${_scan_mount[$i]}"
     [[ "$mnt" != "(not mounted)" ]] || continue
+    # Drive root
     if [[ -d "$mnt/redpill/snapshots" ]]; then
       echo "$mnt"
+      return 0
+    fi
+    # A subfolder on the drive (destination may point at <mnt>/<folder>).
+    # Look one or two levels deep for a redpill/snapshots layout.
+    local hit
+    hit="$(find "$mnt" -mindepth 2 -maxdepth 3 -type d -name snapshots -path '*/redpill/snapshots' -print -quit 2>/dev/null)" || hit=""
+    if [[ -n "$hit" ]]; then
+      echo "${hit%/redpill/snapshots}"
       return 0
     fi
   done
@@ -1530,7 +1764,7 @@ tui(){
       local choice
       local ab_tag="OFF"
       systemctl is-enabled redpill-autobackup &>/dev/null && ab_tag="ON"
-      choice=$(whiptail --title "$APP_TITLE" --menu "Choose" 26 70 14 \
+      choice=$(whiptail --title "$APP_TITLE" --menu "Choose" 27 70 15 \
         1 "Backup configs only" \
         2 "Backup user data only" \
         3 "Backup everything" \
@@ -1538,12 +1772,13 @@ tui(){
         5 "List backups" \
         6 "Delete backups" \
         7 "Verify backup" \
-        8 "Edit include list" \
-        9 "Edit exclude list" \
-        10 "Set backup destination" \
-        11 "Auto-backup on shutdown [$ab_tag]" \
-        12 "Show paths" \
-        13 "Exit" \
+        8 "Choose what to back up" \
+        9 "Edit include list (advanced)" \
+        10 "Edit exclude list" \
+        11 "Set backup destination" \
+        12 "Auto-backup on shutdown [$ab_tag]" \
+        13 "Show paths" \
+        14 "Exit" \
         3>&1 1>&2 2>&3) || break
 
       case "$choice" in
@@ -1652,11 +1887,12 @@ tui(){
           ;;
         6) delete_backups || true; _pause ;;
         7) verify_backup || true; _pause ;;
-        8) "$(tui_editor)" "$INCLUDES_FILE" ;;
-        9) "$(tui_editor)" "$EXCLUDES_FILE" ;;
-        10) set_destination || true; _pause ;;
-        11) toggle_autobackup || true; _pause ;;
-        12)
+        8) choose_includes || true; _pause ;;
+        9) "$(tui_editor)" "$INCLUDES_FILE" ;;
+        10) "$(tui_editor)" "$EXCLUDES_FILE" ;;
+        11) set_destination || true; _pause ;;
+        12) toggle_autobackup || true; _pause ;;
+        13)
           local dest_display
           dest_display="$(read_destination 2>/dev/null)" || dest_display="(not set)"
           _header "PATHS & CONFIGURATION"
@@ -1668,13 +1904,13 @@ tui(){
           _info "Destination file" "$DEST_FILE"
           _pause
           ;;
-        13) break ;;
+        14) break ;;
       esac
     done
   else
     # Fallback: no whiptail
     PS3="redpill> "
-    select a in "Backup configs only" "Backup user data only" "Backup everything" "Restore (latest)" "List backups" "Delete backups" "Verify backup" "Edit include list" "Edit exclude list" "Set backup destination" "Auto-backup on shutdown" "Show paths" "Quit"; do
+    select a in "Backup configs only" "Backup user data only" "Backup everything" "Restore (latest)" "List backups" "Delete backups" "Verify backup" "Choose what to back up" "Edit include list (advanced)" "Edit exclude list" "Set backup destination" "Auto-backup on shutdown" "Show paths" "Quit"; do
       case "$REPLY" in
         1|2|3)
           if ! read_destination >/dev/null 2>&1; then
@@ -1702,11 +1938,12 @@ tui(){
           ;;
         6) delete_backups || true ;;
         7) verify_backup || true ;;
-        8) "$(tui_editor)" "$INCLUDES_FILE" ;;
-        9) "$(tui_editor)" "$EXCLUDES_FILE" ;;
-        10) set_destination || true ;;
-        11) toggle_autobackup || true ;;
-        12)
+        8) choose_includes || true ;;
+        9) "$(tui_editor)" "$INCLUDES_FILE" ;;
+        10) "$(tui_editor)" "$EXCLUDES_FILE" ;;
+        11) set_destination || true ;;
+        12) toggle_autobackup || true ;;
+        13)
           local dest_display
           dest_display="$(read_destination 2>/dev/null)" || dest_display="(not set)"
           _header "PATHS & CONFIGURATION"
@@ -1717,7 +1954,7 @@ tui(){
           _info "Excludes file"    "$EXCLUDES_FILE"
           _info "Destination file" "$DEST_FILE"
           ;;
-        13) break ;;
+        14) break ;;
         *) continue ;;
       esac
     done
@@ -1733,7 +1970,13 @@ case "${1:-tui}" in
   list)          list_snapshots 2>/dev/null || true; echo; list_local ;;
   restore)       restore "${2:-}" ;;
   verify)        verify_backup ;;
-  includes)      "$(tui_editor)" "$INCLUDES_FILE" ;;
+  includes)
+    case "${2:-}" in
+      choose|select|pick) choose_includes ;;
+      *)                  "$(tui_editor)" "$INCLUDES_FILE" ;;
+    esac
+    ;;
+  choose-includes) choose_includes ;;
   excludes)      "$(tui_editor)" "$EXCLUDES_FILE" ;;
   autobackup)    mk_backup "${2:-all}" ;;
   destination)   set_destination ;;
@@ -1747,7 +1990,7 @@ case "${1:-tui}" in
     _info "Excludes file"    "$EXCLUDES_FILE"
     _info "Destination file" "$DEST_FILE"
     ;;
-  *) echo "Usage: redpill [tui|backup [configs|data|all]|autobackup [configs|data|all]|estimate [configs|data|all]|config-backup|restore [FILE|SNAP]|verify|list|includes|excludes|destination|where]" ;;
+  *) echo "Usage: redpill [tui|backup [configs|data|all]|autobackup [configs|data|all]|estimate [configs|data|all]|config-backup|restore [FILE|SNAP]|verify|list|includes [choose]|choose-includes|excludes|destination|where]" ;;
 esac
 BASH
 
