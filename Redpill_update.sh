@@ -290,6 +290,138 @@ read_includes(){
   esac
 }
 
+# ── Interactive "choose what to back up" checklist ──
+# Approach: toggling an entry just comments / uncomments its line in
+# includes.conf. read_includes already skips commented lines, so an entry's
+# section (configs vs user data) and every downstream code path are unchanged.
+#
+# A line is "selectable" if, once leading "#" and spaces are stripped, it looks
+# like a path (starts with ~ or /). Section headers ("# All configs",
+# "# User data", ...) and blank lines are left strictly alone.
+_is_include_path(){
+  # $1 = raw line. Echoes the bare path if selectable, else nothing.
+  local line="$1" stripped
+  stripped="${line#"${line%%[![:space:]]*}"}"          # ltrim
+  stripped="${stripped#\#}"                             # drop one leading #
+  stripped="${stripped#"${stripped%%[![:space:]]*}"}"  # ltrim again
+  case "$stripped" in
+    "~"/*|"~"|/*) printf '%s' "$stripped" ;;
+  esac
+}
+
+_line_is_enabled(){
+  # $1 = raw line. Returns 0 if it's an active (uncommented) path line.
+  local line="$1" t
+  t="${line#"${line%%[![:space:]]*}"}"
+  [[ "$t" != \#* ]]
+}
+
+choose_includes(){
+  [[ -f "$INCLUDES_FILE" ]] || { _err "No includes file at $INCLUDES_FILE"; return 1; }
+
+  # Read the file into arrays: every line, plus which line-numbers are togglable.
+  local -a raw=() cl_args=()
+  local -a path_lineno=() path_text=()
+  local n=0 line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n+1))
+    raw+=("$line")
+    local p
+    p="$(_is_include_path "$line")"
+    if [[ -n "$p" ]]; then
+      path_lineno+=("$n")
+      path_text+=("$p")
+      local state="OFF"
+      _line_is_enabled "$line" && state="ON"
+      cl_args+=("$n" "$p" "$state")
+    fi
+  done < "$INCLUDES_FILE"
+
+  if (( ${#path_lineno[@]} == 0 )); then
+    _err "No selectable paths found in $INCLUDES_FILE"
+    return 1
+  fi
+
+  # Present the checklist
+  local result
+  if command -v whiptail >/dev/null; then
+    result=$(whiptail --title "$APP_TITLE" --checklist \
+      "Space toggles, Enter saves. Unticked paths are commented out (kept in the file)." \
+      24 78 15 "${cl_args[@]}" 3>&1 1>&2 2>&3) || return 1
+  else
+    _header "CHOOSE WHAT TO BACK UP"
+    local i
+    for i in "${!path_lineno[@]}"; do
+      local mark=" "
+      _line_is_enabled "${raw[$(( ${path_lineno[$i]} - 1 ))]}" && mark="x"
+      printf '  %s%2d.%s [%s] %s\n' "$_c_dim" "$((i+1))" "$_c_reset" "$mark" "${path_text[$i]}"
+    done
+    _hr
+    printf '  Enter numbers to TOGGLE (space-separated), or Enter to keep as-is: '
+    local input; read -r input
+    result=""
+    local tok
+    for tok in $input; do
+      [[ "$tok" =~ ^[0-9]+$ ]] || continue
+      (( tok >= 1 && tok <= ${#path_lineno[@]} )) || continue
+      # translate menu index -> line number, flip current state
+      local ln="${path_lineno[$((tok-1))]}"
+      if _line_is_enabled "${raw[$((ln-1))]}"; then
+        :  # currently on -> leave out of "keep on" set
+      else
+        result+="\"$ln\" "
+      fi
+    done
+    # For the no-whiptail path, rebuild "on" set = (currently on, not toggled) + (currently off, toggled)
+    local keep_on=""
+    for i in "${!path_lineno[@]}"; do
+      local ln="${path_lineno[$i]}" toggled=0 t2
+      for t2 in $input; do [[ "$t2" == "$((i+1))" ]] && toggled=1; done
+      local on=0
+      _line_is_enabled "${raw[$((ln-1))]}" && on=1
+      if (( on ^ toggled )); then keep_on+="\"$ln\" "; fi
+    done
+    result="$keep_on"
+  fi
+
+  # Parse selected line-numbers into a lookup set
+  local -A want_on=()
+  local tok
+  for tok in $(echo "$result" | tr -d '"'); do
+    [[ "$tok" =~ ^[0-9]+$ ]] && want_on["$tok"]=1
+  done
+
+  # Rewrite the file: for each togglable line, comment or uncomment to match.
+  # All other lines (headers, blanks, non-path text) pass through untouched.
+  local -A is_path=()
+  for tok in "${path_lineno[@]}"; do is_path["$tok"]=1; done
+
+  local tmp="${INCLUDES_FILE}.tmp.$$"
+  n=0
+  {
+    for line in "${raw[@]}"; do
+      n=$((n+1))
+      if [[ -n "${is_path[$n]:-}" ]]; then
+        local bare="${line#"${line%%[![:space:]]*}"}"
+        bare="${bare#\#}"
+        bare="${bare#"${bare%%[![:space:]]*}"}"
+        if [[ -n "${want_on[$n]:-}" ]]; then
+          printf '%s\n' "$bare"            # enabled
+        else
+          printf '#%s\n' "$bare"           # disabled (kept as comment)
+        fi
+      else
+        printf '%s\n' "$line"
+      fi
+    done
+  } > "$tmp"
+  mv -f "$tmp" "$INCLUDES_FILE"
+
+  local on_count=${#want_on[@]}
+  local total=${#path_lineno[@]}
+  _ok "Saved: $on_count of $total paths selected for backup"
+}
+
 pre_backup_note(){
   echo
   printf '  %s%s%s\n' "$_c_dim" "You take the red pill, you stay in hyprland and" "$_c_reset"
@@ -1602,7 +1734,7 @@ tui(){
       local choice
       local ab_tag="OFF"
       systemctl is-enabled redpill-autobackup &>/dev/null && ab_tag="ON"
-      choice=$(whiptail --title "$APP_TITLE" --menu "Choose" 26 70 14 \
+      choice=$(whiptail --title "$APP_TITLE" --menu "Choose" 27 70 15 \
         1 "Backup configs only" \
         2 "Backup user data only" \
         3 "Backup everything" \
@@ -1610,12 +1742,13 @@ tui(){
         5 "List backups" \
         6 "Delete backups" \
         7 "Verify backup" \
-        8 "Edit include list" \
-        9 "Edit exclude list" \
-        10 "Set backup destination" \
-        11 "Auto-backup on shutdown [$ab_tag]" \
-        12 "Show paths" \
-        13 "Exit" \
+        8 "Choose what to back up" \
+        9 "Edit include list (advanced)" \
+        10 "Edit exclude list" \
+        11 "Set backup destination" \
+        12 "Auto-backup on shutdown [$ab_tag]" \
+        13 "Show paths" \
+        14 "Exit" \
         3>&1 1>&2 2>&3) || break
 
       case "$choice" in
@@ -1724,11 +1857,12 @@ tui(){
           ;;
         6) delete_backups || true; _pause ;;
         7) verify_backup || true; _pause ;;
-        8) "$(tui_editor)" "$INCLUDES_FILE" ;;
-        9) "$(tui_editor)" "$EXCLUDES_FILE" ;;
-        10) set_destination || true; _pause ;;
-        11) toggle_autobackup || true; _pause ;;
-        12)
+        8) choose_includes || true; _pause ;;
+        9) "$(tui_editor)" "$INCLUDES_FILE" ;;
+        10) "$(tui_editor)" "$EXCLUDES_FILE" ;;
+        11) set_destination || true; _pause ;;
+        12) toggle_autobackup || true; _pause ;;
+        13)
           local dest_display
           dest_display="$(read_destination 2>/dev/null)" || dest_display="(not set)"
           _header "PATHS & CONFIGURATION"
@@ -1740,13 +1874,13 @@ tui(){
           _info "Destination file" "$DEST_FILE"
           _pause
           ;;
-        13) break ;;
+        14) break ;;
       esac
     done
   else
     # Fallback: no whiptail
     PS3="redpill> "
-    select a in "Backup configs only" "Backup user data only" "Backup everything" "Restore (latest)" "List backups" "Delete backups" "Verify backup" "Edit include list" "Edit exclude list" "Set backup destination" "Auto-backup on shutdown" "Show paths" "Quit"; do
+    select a in "Backup configs only" "Backup user data only" "Backup everything" "Restore (latest)" "List backups" "Delete backups" "Verify backup" "Choose what to back up" "Edit include list (advanced)" "Edit exclude list" "Set backup destination" "Auto-backup on shutdown" "Show paths" "Quit"; do
       case "$REPLY" in
         1|2|3)
           if ! read_destination >/dev/null 2>&1; then
@@ -1774,11 +1908,12 @@ tui(){
           ;;
         6) delete_backups || true ;;
         7) verify_backup || true ;;
-        8) "$(tui_editor)" "$INCLUDES_FILE" ;;
-        9) "$(tui_editor)" "$EXCLUDES_FILE" ;;
-        10) set_destination || true ;;
-        11) toggle_autobackup || true ;;
-        12)
+        8) choose_includes || true ;;
+        9) "$(tui_editor)" "$INCLUDES_FILE" ;;
+        10) "$(tui_editor)" "$EXCLUDES_FILE" ;;
+        11) set_destination || true ;;
+        12) toggle_autobackup || true ;;
+        13)
           local dest_display
           dest_display="$(read_destination 2>/dev/null)" || dest_display="(not set)"
           _header "PATHS & CONFIGURATION"
@@ -1789,7 +1924,7 @@ tui(){
           _info "Excludes file"    "$EXCLUDES_FILE"
           _info "Destination file" "$DEST_FILE"
           ;;
-        13) break ;;
+        14) break ;;
         *) continue ;;
       esac
     done
@@ -1805,7 +1940,13 @@ case "${1:-tui}" in
   list)          list_snapshots 2>/dev/null || true; echo; list_local ;;
   restore)       restore "${2:-}" ;;
   verify)        verify_backup ;;
-  includes)      "$(tui_editor)" "$INCLUDES_FILE" ;;
+  includes)
+    case "${2:-}" in
+      choose|select|pick) choose_includes ;;
+      *)                  "$(tui_editor)" "$INCLUDES_FILE" ;;
+    esac
+    ;;
+  choose-includes) choose_includes ;;
   excludes)      "$(tui_editor)" "$EXCLUDES_FILE" ;;
   autobackup)    mk_backup "${2:-all}" ;;
   destination)   set_destination ;;
@@ -1819,7 +1960,7 @@ case "${1:-tui}" in
     _info "Excludes file"    "$EXCLUDES_FILE"
     _info "Destination file" "$DEST_FILE"
     ;;
-  *) echo "Usage: redpill [tui|backup [configs|data|all]|autobackup [configs|data|all]|estimate [configs|data|all]|config-backup|restore [FILE|SNAP]|verify|list|includes|excludes|destination|where]" ;;
+  *) echo "Usage: redpill [tui|backup [configs|data|all]|autobackup [configs|data|all]|estimate [configs|data|all]|config-backup|restore [FILE|SNAP]|verify|list|includes [choose]|choose-includes|excludes|destination|where]" ;;
 esac
 BASH
 
