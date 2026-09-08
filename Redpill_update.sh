@@ -291,135 +291,165 @@ read_includes(){
 }
 
 # ── Interactive "choose what to back up" checklist ──
-# Approach: toggling an entry just comments / uncomments its line in
-# includes.conf. read_includes already skips commented lines, so an entry's
-# section (configs vs user data) and every downstream code path are unchanged.
+# Scans your real $HOME for every top-level file and folder (dotfiles
+# included), merges in any deeper paths already active in includes.conf
+# (e.g. ~/.local/share/fonts), and shows one checklist. Ticked entries are
+# written back to includes.conf; everything else in the file is dropped.
 #
-# A line is "selectable" if, once leading "#" and spaces are stripped, it looks
-# like a path (starts with ~ or /). Section headers ("# All configs",
-# "# User data", ...) and blank lines are left strictly alone.
-_is_include_path(){
-  # $1 = raw line. Echoes the bare path if selectable, else nothing.
-  local line="$1" stripped
-  stripped="${line#"${line%%[![:space:]]*}"}"          # ltrim
-  stripped="${stripped#\#}"                             # drop one leading #
-  stripped="${stripped#"${stripped%%[![:space:]]*}"}"  # ltrim again
-  case "$stripped" in
-    "~"/*|"~"|/*) printf '%s' "$stripped" ;;
-  esac
+# The file keeps its two-section shape so read_includes / the configs|data|all
+# modes and the incremental --link-dest logic are all unchanged: well-known
+# user-data dirs go under "# User data", everything else under "# All configs".
+
+# Directories treated as "user data" (rest of the tree is "configs")
+_USERDATA_DIRS=(Documents Pictures Music Videos Desktop Downloads Templates Public)
+
+_is_userdata_path(){
+  # $1 = a path like ~/Pictures or /home/x/Pictures. Returns 0 if user-data.
+  local base="${1##*/}" d
+  for d in "${_USERDATA_DIRS[@]}"; do
+    [[ "$base" == "$d" ]] && return 0
+  done
+  return 1
 }
 
-_line_is_enabled(){
-  # $1 = raw line. Returns 0 if it's an active (uncommented) path line.
-  local line="$1" t
-  t="${line#"${line%%[![:space:]]*}"}"
-  [[ "$t" != \#* ]]
+# Normalise a path for comparison: expand leading ~ , strip trailing slash.
+_norm_path(){
+  local p="$1"
+  p="${p/#\~/$HOME}"
+  p="${p%/}"
+  printf '%s' "$p"
+}
+
+# Pretty form for display/storage: collapse $HOME back to ~
+_tilde_path(){
+  local p="$1"
+  [[ "$p" == "$HOME"/* ]] && p="~${p#"$HOME"}"
+  [[ "$p" == "$HOME" ]] && p="~"
+  printf '%s' "$p"
+}
+
+# Currently-active (uncommented) path lines from includes.conf, ~-collapsed.
+_active_includes(){
+  [[ -f "$INCLUDES_FILE" ]] || return 0
+  grep -vE '^\s*#' "$INCLUDES_FILE" | sed '/^\s*$/d;s/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
 choose_includes(){
-  [[ -f "$INCLUDES_FILE" ]] || { _err "No includes file at $INCLUDES_FILE"; return 1; }
+  mkdir -p "$CONF_DIR"
 
-  # Read the file into arrays: every line, plus which line-numbers are togglable.
-  local -a raw=() cl_args=()
-  local -a path_lineno=() path_text=()
-  local n=0 line
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    n=$((n+1))
-    raw+=("$line")
-    local p
-    p="$(_is_include_path "$line")"
-    if [[ -n "$p" ]]; then
-      path_lineno+=("$n")
-      path_text+=("$p")
-      local state="OFF"
-      _line_is_enabled "$line" && state="ON"
-      cl_args+=("$n" "$p" "$state")
+  # 1) Candidate set: everything directly in $HOME ...
+  local -A seen=()          # normalised path -> 1  (dedupe)
+  local -a cand=()          # ~-form paths, display order
+  local entry np
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    np="$(_norm_path "$entry")"
+    [[ -n "${seen[$np]:-}" ]] && continue
+    seen[$np]=1
+    cand+=("$(_tilde_path "$np")")
+  done < <(find "$HOME" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort -f | sed "s#^#$HOME/#")
+
+  # ... plus any deeper path already active in includes.conf (kept, ticked).
+  local -A active=()
+  local a
+  while IFS= read -r a; do
+    [[ -n "$a" ]] || continue
+    np="$(_norm_path "$a")"
+    active[$np]=1
+    if [[ -z "${seen[$np]:-}" ]]; then
+      seen[$np]=1
+      cand+=("$(_tilde_path "$np")")
     fi
-  done < "$INCLUDES_FILE"
+  done < <(_active_includes)
 
-  if (( ${#path_lineno[@]} == 0 )); then
-    _err "No selectable paths found in $INCLUDES_FILE"
+  if (( ${#cand[@]} == 0 )); then
+    _err "Nothing found in $HOME to choose from."
     return 1
   fi
 
-  # Present the checklist
+  # 2) Build checklist rows. Tag=index, item=path, state=ON if active now.
+  local -a cl_args=()
+  local i tag desc state
+  for i in "${!cand[@]}"; do
+    np="$(_norm_path "${cand[$i]}")"
+    state="OFF"; [[ -n "${active[$np]:-}" ]] && state="ON"
+    desc="${cand[$i]}"
+    if [[ -d "$np" ]]; then desc="$desc/"; fi
+    _is_userdata_path "$np" && desc="$desc   (user data)"
+    cl_args+=("$i" "$desc" "$state")
+  done
+
+  # 3) Present it
   local result
   if command -v whiptail >/dev/null; then
     result=$(whiptail --title "$APP_TITLE" --checklist \
-      "Space toggles, Enter saves. Unticked paths are commented out (kept in the file)." \
-      24 78 15 "${cl_args[@]}" 3>&1 1>&2 2>&3) || return 1
+      "Everything in your home directory. Space toggles, Enter saves.\nTicked entries are what gets backed up." \
+      26 82 17 "${cl_args[@]}" 3>&1 1>&2 2>&3) || return 1
   else
     _header "CHOOSE WHAT TO BACK UP"
-    local i
-    for i in "${!path_lineno[@]}"; do
-      local mark=" "
-      _line_is_enabled "${raw[$(( ${path_lineno[$i]} - 1 ))]}" && mark="x"
-      printf '  %s%2d.%s [%s] %s\n' "$_c_dim" "$((i+1))" "$_c_reset" "$mark" "${path_text[$i]}"
+    for i in "${!cand[@]}"; do
+      np="$(_norm_path "${cand[$i]}")"
+      local mark=" "; [[ -n "${active[$np]:-}" ]] && mark="x"
+      local suffix=""; [[ -d "$np" ]] && suffix="/"
+      printf '  %s%3d.%s [%s] %s%s\n' "$_c_dim" "$i" "$_c_reset" "$mark" "${cand[$i]}" "$suffix"
     done
     _hr
-    printf '  Enter numbers to TOGGLE (space-separated), or Enter to keep as-is: '
+    printf '  Enter numbers to TOGGLE (space-separated), q to cancel: '
     local input; read -r input
-    result=""
+    [[ "$input" == "q" ]] && return 1
+    # start from current state, flip toggled indices
+    local -A on=()
+    for i in "${!cand[@]}"; do
+      np="$(_norm_path "${cand[$i]}")"
+      [[ -n "${active[$np]:-}" ]] && on[$i]=1
+    done
     local tok
     for tok in $input; do
       [[ "$tok" =~ ^[0-9]+$ ]] || continue
-      (( tok >= 1 && tok <= ${#path_lineno[@]} )) || continue
-      # translate menu index -> line number, flip current state
-      local ln="${path_lineno[$((tok-1))]}"
-      if _line_is_enabled "${raw[$((ln-1))]}"; then
-        :  # currently on -> leave out of "keep on" set
-      else
-        result+="\"$ln\" "
-      fi
+      (( tok >= 0 && tok < ${#cand[@]} )) || continue
+      if [[ -n "${on[$tok]:-}" ]]; then unset 'on[$tok]'; else on[$tok]=1; fi
     done
-    # For the no-whiptail path, rebuild "on" set = (currently on, not toggled) + (currently off, toggled)
-    local keep_on=""
-    for i in "${!path_lineno[@]}"; do
-      local ln="${path_lineno[$i]}" toggled=0 t2
-      for t2 in $input; do [[ "$t2" == "$((i+1))" ]] && toggled=1; done
-      local on=0
-      _line_is_enabled "${raw[$((ln-1))]}" && on=1
-      if (( on ^ toggled )); then keep_on+="\"$ln\" "; fi
-    done
-    result="$keep_on"
+    result=""
+    for i in "${!on[@]}"; do result+="\"$i\" "; done
   fi
 
-  # Parse selected line-numbers into a lookup set
-  local -A want_on=()
-  local tok
-  for tok in $(echo "$result" | tr -d '"'); do
-    [[ "$tok" =~ ^[0-9]+$ ]] && want_on["$tok"]=1
+  # 4) Resolve selected indices -> chosen paths, split into two sections
+  local -a pick_cfg=() pick_data=()
+  local idx
+  for idx in $(echo "$result" | tr -d '"'); do
+    [[ "$idx" =~ ^[0-9]+$ ]] || continue
+    (( idx >= 0 && idx < ${#cand[@]} )) || continue
+    local ppath="${cand[$idx]}"
+    if _is_userdata_path "$(_norm_path "$ppath")"; then
+      pick_data+=("$ppath")
+    else
+      pick_cfg+=("$ppath")
+    fi
   done
 
-  # Rewrite the file: for each togglable line, comment or uncomment to match.
-  # All other lines (headers, blanks, non-path text) pass through untouched.
-  local -A is_path=()
-  for tok in "${path_lineno[@]}"; do is_path["$tok"]=1; done
+  if (( ${#pick_cfg[@]} + ${#pick_data[@]} == 0 )); then
+    _warn "Nothing selected — includes.conf left unchanged."
+    return 0
+  fi
 
+  # 5) Rewrite includes.conf (backup the old one once)
+  [[ -f "$INCLUDES_FILE" && ! -f "${INCLUDES_FILE}.bak" ]] && cp "$INCLUDES_FILE" "${INCLUDES_FILE}.bak"
   local tmp="${INCLUDES_FILE}.tmp.$$"
-  n=0
   {
-    for line in "${raw[@]}"; do
-      n=$((n+1))
-      if [[ -n "${is_path[$n]:-}" ]]; then
-        local bare="${line#"${line%%[![:space:]]*}"}"
-        bare="${bare#\#}"
-        bare="${bare#"${bare%%[![:space:]]*}"}"
-        if [[ -n "${want_on[$n]:-}" ]]; then
-          printf '%s\n' "$bare"            # enabled
-        else
-          printf '#%s\n' "$bare"           # disabled (kept as comment)
-        fi
-      else
-        printf '%s\n' "$line"
-      fi
-    done
+    echo "# Selected via 'redpill choose-includes' on $(date +%Y-%m-%d)"
+    echo "# Re-run that (or edit this file) to change what gets backed up."
+    echo
+    echo "# All configs"
+    local p
+    for p in "${pick_cfg[@]}"; do printf '%s\n' "$p"; done
+    echo
+    echo "# User data"
+    for p in "${pick_data[@]}"; do printf '%s\n' "$p"; done
   } > "$tmp"
   mv -f "$tmp" "$INCLUDES_FILE"
 
-  local on_count=${#want_on[@]}
-  local total=${#path_lineno[@]}
-  _ok "Saved: $on_count of $total paths selected for backup"
+  _ok "Saved ${#pick_cfg[@]} config + ${#pick_data[@]} data path(s) to includes.conf"
+  printf '  %sPrevious list kept at %s.bak%s\n' "$_c_dim" "$INCLUDES_FILE" "$_c_reset"
 }
 
 pre_backup_note(){
